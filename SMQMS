@@ -1,0 +1,262 @@
+#include <Arduino.h>
+#include <Keypad.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ====== Pins / Peripherals ======
+HardwareSerial GSM(2); // UART2 on ESP32 (RX=16, TX=17)
+
+// Keypad 3x4
+const byte ROWS = 4, COLS = 3;
+char keys[ROWS][COLS] = {
+  {'1','2','3'},
+  {'4','5','6'},
+  {'7','8','9'},
+  {'*','0','#'}
+};
+byte rowPins[ROWS] = {32, 33, 25, 26}; // R1..R4
+byte colPins[COLS] = {27, 14, 12};     // C1..C3
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// LCD (change address to 0x3F if needed)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Staff button & Buzzer
+const int BTN_NEXT = 19;           // INPUT_PULLUP
+const int BUZZER_PIN = 18;         // via NPN transistor
+
+// UART speeds
+const uint32_t SERIAL_BAUD = 115200;
+const uint32_t GSM_BAUD    = 9600;
+
+// ====== Queue model ======
+struct Entry {
+  uint32_t token;
+  String   phone; // +91xxxxxxxxxx
+};
+const int QCAP = 100;
+Entry queueBuf[QCAP];
+int qHead = 0, qTail = 0, qCount = 0;
+
+String numberBuf;
+Preferences prefs;
+uint32_t tokenCounter = 0;
+
+// ====== Utils ======
+void beepOK() { // short confirmation
+  digitalWrite(BUZZER_PIN, HIGH); delay(80);
+  digitalWrite(BUZZER_PIN, LOW);  delay(40);
+}
+void beepDouble() { // call alert
+  for (int i=0;i<2;i++){ digitalWrite(BUZZER_PIN, HIGH); delay(120); digitalWrite(BUZZER_PIN, LOW); delay(100); }
+}
+void beepError() { // longer error
+  digitalWrite(BUZZER_PIN, HIGH); delay(300);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+bool is10Digits(const String &s){
+  if (s.length() != 10) return false;
+  for (char c: s) if (c<'0' || c>'9') return false;
+  return true;
+}
+
+void lcdStatus(const String &l1, const String &l2=""){
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print(l1.substring(0,16));
+  lcd.setCursor(0,1); lcd.print(l2.substring(0,16));
+}
+
+// ====== GSM helpers ======
+bool sendAT(const String &cmd, const String &expect, uint32_t timeoutMs=2000) {
+  while (GSM.available()) GSM.read();
+  GSM.println(cmd);
+  uint32_t start = millis();
+  String resp;
+  while (millis() - start < timeoutMs) {
+    while (GSM.available()) {
+      resp += (char)GSM.read();
+      if (resp.indexOf(expect) >= 0) return true;
+      if (resp.indexOf("ERROR") >= 0) return false;
+    }
+    delay(5);
+  }
+  Serial.println("AT TIMEOUT: " + cmd);
+  Serial.println(resp);
+  return false;
+}
+
+bool waitForNetwork(uint32_t timeoutMs=30000) {
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    if (!sendAT("AT", "OK", 800)) { delay(400); continue; }
+    sendAT("ATE0", "OK", 800);
+    if (!sendAT("AT+CPIN?", "READY", 1500)) { lcdStatus("SIM not ready"); delay(1000); continue; }
+    GSM.println("AT+CREG?");
+    String r; uint32_t t0 = millis();
+    while (millis() - t0 < 1500) { while (GSM.available()) r += (char)GSM.read(); }
+    if (r.indexOf("+CREG:")>=0 && (r.indexOf(",1")>=0 || r.indexOf(",5")>=0)) return true;
+    lcdStatus("Waiting network..");
+    delay(1000);
+  }
+  return false;
+}
+
+bool sendSMS(const String &e164, const String &text) {
+  if (!sendAT("AT+CMGF=1", "OK", 1000)) return false;
+  if (!sendAT("AT+CSCS=\"GSM\"", "OK", 1000)) return false;
+
+  while (GSM.available()) GSM.read();
+  GSM.print("AT+CMGS=\""); GSM.print(e164); GSM.println("\"");
+  delay(200);
+
+  uint32_t start = millis(); bool prompt=false;
+  while (millis()-start < 3000) { if (GSM.available() && (char)GSM.read()=='>') { prompt=true; break; } }
+  if (!prompt) return false;
+
+  GSM.print(text);
+  GSM.write(26); // Ctrl+Z
+  String resp; start = millis();
+  while (millis()-start < 15000) {
+    while (GSM.available()) {
+      resp += (char)GSM.read();
+      if (resp.indexOf("+CMGS:")>=0 && resp.indexOf("OK")>=0) return true;
+      if (resp.indexOf("ERROR")>=0) return false;
+    }
+    delay(10);
+  }
+  return false;
+}
+
+// ====== Queue ops ======
+bool enqueue(const Entry &e){
+  if (qCount >= QCAP) return false;
+  queueBuf[qTail] = e;
+  qTail = (qTail+1) % QCAP;
+  qCount++;
+  return true;
+}
+bool dequeue(Entry &out){
+  if (qCount == 0) return false;
+  out = queueBuf[qHead];
+  qHead = (qHead+1) % QCAP;
+  qCount--;
+  return true;
+}
+
+// ====== Setup / Loop ======
+void setup() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+
+  Serial.begin(SERIAL_BAUD);
+  delay(300);
+
+  // LCD
+  Wire.begin(21,22);
+  lcd.init();
+  lcd.backlight();
+  lcdStatus("Booting...");
+
+  // Token persistence
+  prefs.begin("queue", false);
+  tokenCounter = prefs.getULong("token", 0);
+  prefs.end();
+
+  // GSM
+  GSM.begin(GSM_BAUD, SERIAL_8N1, 16, 17);
+  if (waitForNetwork()) {
+    lcdStatus("GSM Ready", "Token: " + String(tokenCounter));
+  } else {
+    lcdStatus("No network!", "Check SIM/ANT");
+  }
+
+  numberBuf.reserve(16);
+  Serial.println("Enter 10 digits; '#'=Send, '*'=Clear");
+}
+
+bool wasPressed = false;
+uint32_t lastBtnChange = 0;
+
+void loop() {
+  // ---- Keypad handling ----
+  char key = keypad.getKey();
+  if (key) {
+    if (key>='0' && key<='9') {
+      if (numberBuf.length() < 10) {
+        numberBuf += key;
+        lcdStatus("Num: " + numberBuf, "Len: " + String(numberBuf.length()));
+      } else {
+        lcdStatus("Max 10 digits", "Press # to send");
+      }
+    } else if (key=='*') {
+      numberBuf = "";
+      lcdStatus("Cleared", "");
+    } else if (key=='#') {
+      if (!is10Digits(numberBuf)) {
+        lcdStatus("Invalid number", "Need 10 digits");
+        beepError();
+      } else {
+        // New token + enqueue
+        tokenCounter++;
+        prefs.begin("queue", false);
+        prefs.putULong("token", tokenCounter);
+        prefs.end();
+
+        Entry e;
+        e.token = tokenCounter;
+        e.phone = "+91" + numberBuf;
+
+        if (!enqueue(e)) {
+          lcdStatus("Queue FULL", "Try later");
+          beepError();
+        } else {
+          // Send registration SMS
+          String msg = "Token T" + String(e.token) + " registered. Status: WAITING.";
+          bool ok=false;
+          for (int i=0; i<3 && !ok; i++){ ok = sendSMS(e.phone, msg); if(!ok) delay(1500*(i+1)); }
+          if (ok) {
+            lcdStatus("Reg OK: T"+String(e.token), "Q:"+String(qCount)+"  Num:"+numberBuf);
+            beepOK();
+            numberBuf = "";
+          } else {
+            lcdStatus("SMS FAIL (Reg)", "Check net/balance");
+            beepError();
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Staff NEXT button (debounced) ----
+  bool pressed = (digitalRead(BTN_NEXT) == LOW);
+  uint32_t now = millis();
+  if (pressed != wasPressed && (now - lastBtnChange) > 35) { // debounce
+    lastBtnChange = now;
+    wasPressed = pressed;
+    if (pressed) {
+      if (qCount == 0) {
+        lcdStatus("Queue empty", "");
+        beepError();
+      } else {
+        Entry call;
+        if (dequeue(call)) {
+          String msg = "Token T" + String(call.token) + ": Please come in now.";
+          bool ok=false;
+          for (int i=0; i<3 && !ok; i++){ ok = sendSMS(call.phone, msg); if(!ok) delay(1500*(i+1)); }
+          if (ok) {
+            lcdStatus("Calling: T"+String(call.token), "Left in Q: "+String(qCount));
+            beepDouble();
+          } else {
+            lcdStatus("SMS FAIL (Call)", "Retry later");
+            beepError();
+            // optional: re-enqueue on failure
+            enqueue(call);
+          }
+        }
+      }
+    }
+  }
+}
